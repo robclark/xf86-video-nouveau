@@ -259,7 +259,7 @@ NV30PutTextureImage(ScrnInfoPtr pScrn, struct nouveau_bo *src, int src_offset,
 	struct nouveau_channel *chan = pNv->chan;
 	struct nouveau_grobj *rankine = pNv->Nv3D;
 	struct nouveau_bo *bo = nouveau_pixmap_bo(ppix);
-	Bool bicubic = pPriv->bicubic;
+	Bool bicubic = pPriv && pPriv->bicubic;
 	float X1, X2, Y1, Y2;
 	BoxPtr pbox;
 	int nbox;
@@ -349,7 +349,7 @@ NV30PutTextureImage(ScrnInfoPtr pScrn, struct nouveau_bo *src, int src_offset,
 	}
 
 	/* Just before rendering we wait for vblank in the non-composited case. */
-	if (pPriv->SyncToVBlank) {
+	if (pPriv && pPriv->SyncToVBlank) {
 		FIRE_RING(chan);
 		NV11SyncToVBlank(ppix, dstBox);
 	}

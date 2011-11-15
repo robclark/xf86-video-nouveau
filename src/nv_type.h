@@ -156,6 +156,7 @@ typedef struct _NVPortPrivRec {
 #define NOUVEAU_CREATE_PIXMAP_ZETA	0x10000000
 #define NOUVEAU_CREATE_PIXMAP_TILED	0x20000000
 #define NOUVEAU_CREATE_PIXMAP_SCANOUT	0x40000000
+#define NOUVEAU_CREATE_PIXMAP_VIDEO	0x80000000
 
 struct nouveau_pixmap {
 	struct nouveau_bo *bo;

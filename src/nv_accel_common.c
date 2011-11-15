@@ -30,6 +30,7 @@ nouveau_allocate_surface(ScrnInfoPtr scrn, int width, int height, int bpp,
 	NVPtr pNv = NVPTR(scrn);
 	Bool scanout = (usage_hint & NOUVEAU_CREATE_PIXMAP_SCANOUT);
 	Bool tiled = (usage_hint & NOUVEAU_CREATE_PIXMAP_TILED);
+	Bool video = (usage_hint & NOUVEAU_CREATE_PIXMAP_VIDEO);
 	int tile_mode = 0, tile_flags = 0;
 	int flags = NOUVEAU_BO_MAP | (bpp >= 8 ? NOUVEAU_BO_VRAM : 0);
 	int cpp = bpp / 8, ret;
@@ -113,6 +114,16 @@ nouveau_allocate_surface(ScrnInfoPtr scrn, int width, int height, int bpp,
 
 	if (usage_hint & NOUVEAU_CREATE_PIXMAP_SCANOUT)
 		tile_flags |= NOUVEAU_BO_TILE_SCANOUT;
+
+	if (video) {
+		if (pNv->Architecture == NV_ARCH_50)
+			tile_flags = 0x7000;
+		else if (pNv->Architecture == NV_ARCH_C0)
+			tile_flags = 0xfe00;
+		tile_flags |= NOUVEAU_BO_TILE_SCANOUT;
+		tile_mode = 0;
+		flags = NOUVEAU_BO_MAP | NOUVEAU_BO_GART;
+	}
 
 	ret = nouveau_bo_new_tile(pNv->dev, flags, 0, *pitch * height,
 				  tile_mode, tile_flags, bo);

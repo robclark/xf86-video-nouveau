@@ -561,6 +561,10 @@ NVCopyNV12ColorPlanes(unsigned char *src1, unsigned char *src2,
 }
 
 
+// put these somewhere common..
+#define FOURCC(a, b, c, d) ((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | ((uint32_t)(uint8_t)(c) << 16) | ((uint32_t)(uint8_t)(d) << 24 ))
+#define FOURCC_STR(str)    FOURCC(str[0], str[1], str[2], str[3])
+
 static int
 NV_set_dimensions(ScrnInfoPtr pScrn, int action_flags, INT32 *xa, INT32 *xb,
 		  INT32 *ya, INT32 *yb, short *src_x, short *src_y,
@@ -887,6 +891,87 @@ NV_set_action_flags(ScrnInfoPtr pScrn, DrawablePtr pDraw, NVPortPrivPtr pPriv,
 	}
 }
 
+/* move from GART -> VRAM */
+static int
+nouveau_xv_m2mf(ScrnInfoPtr pScrn, int action_flags,
+		struct nouveau_bo *src /* GART buffer */,
+		struct nouveau_bo *dst /* VRAM buffer */,
+		int offset, int uv_offset, int nlines, int line_len, int dstPitch)
+{
+	NVPtr pNv = NVPTR(pScrn);
+	struct nouveau_channel *chan = pNv->chan;
+	struct nouveau_grobj *m2mf = pNv->NvMemFormat;
+
+	if (pNv->Architecture >= NV_ARCH_C0) {
+		nvc0_xv_m2mf(m2mf, dst, uv_offset, dstPitch,
+			     nlines, src, line_len);
+		return Success;
+	}
+
+	if (MARK_RING(chan, 64, 4))
+		return BadAlloc;
+
+	BEGIN_RING(chan, m2mf,
+		   NV04_MEMORY_TO_MEMORY_FORMAT_DMA_BUFFER_IN, 2);
+	OUT_RING  (chan, pNv->chan->gart->handle);
+	OUT_RING  (chan, pNv->chan->vram->handle);
+
+	if (pNv->Architecture >= NV_ARCH_50) {
+		BEGIN_RING(chan, m2mf, NV50_MEMORY_TO_MEMORY_FORMAT_LINEAR_IN, 1);
+		OUT_RING  (chan, 1);
+
+		BEGIN_RING(chan, m2mf, NV50_MEMORY_TO_MEMORY_FORMAT_LINEAR_OUT, 7);
+		OUT_RING  (chan, 0);
+		OUT_RING  (chan, src->tile_mode << 4);
+		OUT_RING  (chan, dstPitch);
+		OUT_RING  (chan, nlines);
+		OUT_RING  (chan, 1);
+		OUT_RING  (chan, 0);
+		OUT_RING  (chan, 0);
+	}
+
+	/* DMA to VRAM */
+	if ( (action_flags & IS_YV12) &&
+	    !(action_flags & CONVERT_TO_YUY2)) {
+		/* we start the color plane transfer separately */
+
+		BEGIN_RING(chan, m2mf,
+			   NV04_MEMORY_TO_MEMORY_FORMAT_OFFSET_IN, 8);
+		if (OUT_RELOCl(chan, src,
+			       line_len * nlines,
+			       NOUVEAU_BO_GART | NOUVEAU_BO_RD) ||
+		    OUT_RELOCl(chan, dst,
+			       offset + uv_offset,
+			       NOUVEAU_BO_VRAM | NOUVEAU_BO_WR)) {
+			MARK_UNDO(chan);
+			return BadAlloc;
+		}
+		OUT_RING  (chan, line_len);
+		OUT_RING  (chan, dstPitch);
+		OUT_RING  (chan, line_len);
+		OUT_RING  (chan, (nlines >> 1));
+		OUT_RING  (chan, (1<<8)|1);
+		OUT_RING  (chan, 0);
+	}
+
+	BEGIN_RING(chan, m2mf,
+		   NV04_MEMORY_TO_MEMORY_FORMAT_OFFSET_IN, 8);
+	if (OUT_RELOCl(chan, src, 0,
+		       NOUVEAU_BO_GART | NOUVEAU_BO_RD) ||
+	    OUT_RELOCl(chan, dst, offset,
+		       NOUVEAU_BO_VRAM | NOUVEAU_BO_WR)) {
+		MARK_UNDO(chan);
+		return BadAlloc;
+	}
+	OUT_RING  (chan, line_len);
+	OUT_RING  (chan, dstPitch);
+	OUT_RING  (chan, line_len);
+	OUT_RING  (chan, nlines);
+	OUT_RING  (chan, (1<<8)|1);
+	OUT_RING  (chan, 0);
+
+	return Success;
+}
 
 /**
  * NVPutImage
@@ -936,8 +1021,6 @@ NVPutImage(ScrnInfoPtr pScrn, short src_x, short src_y, short drw_x,
 	 * and lines we are interested in
 	 */
 	int top = 0, left = 0, right = 0, bottom = 0, npixels = 0, nlines = 0;
-	struct nouveau_channel *chan = pNv->chan;
-	struct nouveau_grobj *m2mf = pNv->NvMemFormat;
 	Bool skip = FALSE;
 	BoxRec dstBox;
 	CARD32 tmp = 0;
@@ -1111,73 +1194,17 @@ NVPutImage(ScrnInfoPtr pScrn, short src_x, short src_y, short drw_x,
 
 		nouveau_bo_unmap(destination_buffer);
 
+		ret = nouveau_xv_m2mf(pScrn, action_flags,
+				destination_buffer, pPriv->video_mem,
+				offset, uv_offset, nlines, line_len, dstPitch);
+		if (ret != Success) {
+			return ret;
+		}
+
 		if (pNv->Architecture >= NV_ARCH_C0) {
-			nvc0_xv_m2mf(m2mf, pPriv->video_mem, uv_offset, dstPitch,
-				     nlines, destination_buffer, line_len);
+			/* is this needed?  It is to preserve the original code flow */
 			goto put_image;
 		}
-
-		if (MARK_RING(chan, 64, 4))
-			return FALSE;
-
-		BEGIN_RING(chan, m2mf,
-			   NV04_MEMORY_TO_MEMORY_FORMAT_DMA_BUFFER_IN, 2);
-		OUT_RING  (chan, pNv->chan->gart->handle);
-		OUT_RING  (chan, pNv->chan->vram->handle);
-
-		if (pNv->Architecture >= NV_ARCH_50) {
-			BEGIN_RING(chan, m2mf, NV50_MEMORY_TO_MEMORY_FORMAT_LINEAR_IN, 1);
-			OUT_RING  (chan, 1);
-
-			BEGIN_RING(chan, m2mf, NV50_MEMORY_TO_MEMORY_FORMAT_LINEAR_OUT, 7);
-			OUT_RING  (chan, 0);
-			OUT_RING  (chan, destination_buffer->tile_mode << 4);
-			OUT_RING  (chan, dstPitch);
-			OUT_RING  (chan, nlines);
-			OUT_RING  (chan, 1);
-			OUT_RING  (chan, 0);
-			OUT_RING  (chan, 0);
-		}
-
-		/* DMA to VRAM */
-		if ( (action_flags & IS_YV12) &&
-		    !(action_flags & CONVERT_TO_YUY2)) {
-			/* we start the color plane transfer separately */
-
-			BEGIN_RING(chan, m2mf,
-				   NV04_MEMORY_TO_MEMORY_FORMAT_OFFSET_IN, 8);
-			if (OUT_RELOCl(chan, destination_buffer,
-				       line_len * nlines,
-				       NOUVEAU_BO_GART | NOUVEAU_BO_RD) ||
-			    OUT_RELOCl(chan, pPriv->video_mem,
-				       offset + uv_offset,
-				       NOUVEAU_BO_VRAM | NOUVEAU_BO_WR)) {
-				MARK_UNDO(chan);
-				return BadAlloc;
-			}
-			OUT_RING  (chan, line_len);
-			OUT_RING  (chan, dstPitch);
-			OUT_RING  (chan, line_len);
-			OUT_RING  (chan, (nlines >> 1));
-			OUT_RING  (chan, (1<<8)|1);
-			OUT_RING  (chan, 0);
-		}
-
-		BEGIN_RING(chan, m2mf,
-			   NV04_MEMORY_TO_MEMORY_FORMAT_OFFSET_IN, 8);
-		if (OUT_RELOCl(chan, destination_buffer, 0,
-			       NOUVEAU_BO_GART | NOUVEAU_BO_RD) ||
-		    OUT_RELOCl(chan, pPriv->video_mem, offset,
-			       NOUVEAU_BO_VRAM | NOUVEAU_BO_WR)) {
-			MARK_UNDO(chan);
-			return BadAlloc;
-		}
-		OUT_RING  (chan, line_len);
-		OUT_RING  (chan, dstPitch);
-		OUT_RING  (chan, line_len);
-		OUT_RING  (chan, nlines);
-		OUT_RING  (chan, (1<<8)|1);
-		OUT_RING  (chan, 0);
 	} else {
 CPU_copy:
 		nouveau_bo_map(pPriv->video_mem, NOUVEAU_BO_WR);
@@ -1355,6 +1382,171 @@ put_image:
 
 	return Success;
 }
+
+int
+nouveau_put_texture_image(DrawablePtr pDraw, PixmapPtr srcPix, int id,
+		short src_x, short src_y, short drw_x, short drw_y,
+		short src_w, short src_h, short drw_w, short drw_h,
+		short width, short height)
+{
+	ScrnInfoPtr pScrn = xf86Screens[pDraw->pScreen->myNum];
+	NVPtr pNv = NVPTR(pScrn);
+	PixmapPtr dstPix = NVGetDrawablePixmap(pDraw);
+	BoxRec dstBox;
+	RegionRec clipRegion;
+	int action_flags;
+	struct nouveau_bo *src;
+	int ret = BadImplementation;
+
+	// XXX we just need pPriv->video_mem... maybe there is a better way?
+	NVPortPrivPtr pPriv = (NVPortPrivPtr)((pNv)->textureAdaptor[0]->pPortPrivates[0].ptr);
+
+	/* source box */
+	INT32 xa = 0, xb = 0, ya = 0, yb = 0;
+	/* size to allocate in VRAM and in GART respectively */
+	int newFBSize = 0, newTTSize = 0;  /* ignored */
+	/* card VRAM offsets, source offsets for U and V planes */
+	int offset = 0, uv_offset = 0, s2offset = 0, s3offset = 0;
+	/* source pitch, source pitch of U and V planes in case of YV12,
+	 * VRAM destination pitch
+	 */
+	int srcPitch = 0, srcPitch2 = 0, dstPitch = 0;
+	/* position of the given source data (using src_*), number of pixels
+	 * and lines we are interested in
+	 */
+	int top = 0, left = 0, right = 0, bottom = 0, npixels = 0, nlines = 0;
+	/* length of a line, like npixels, but in bytes */
+	int line_len = 0;
+
+	RegionInit(&clipRegion, (&(BoxRec){ 0, 0, pDraw->width, pDraw->height }), 0);
+	RegionTranslate(&clipRegion, pDraw->x, pDraw->y);
+
+	action_flags = USE_TEXTURE;
+
+	switch(id) {
+	case FOURCC_YUY2:
+	case FOURCC_UYVY:
+		action_flags |= IS_YUY2;
+		break;
+	case FOURCC_I420:
+		action_flags |= SWAP_UV;
+		/* fallthrough */
+	case FOURCC_YV12:
+		action_flags |= IS_YV12;
+		break;
+	case FOURCC_RGB:
+	case FOURCC('R','G','B','4'):
+	case FOURCC('R','G','B','3'):
+		action_flags |= IS_RGB;
+		break;
+	default:
+		return BadColor;
+	}
+
+	if (NV_set_dimensions(pScrn, action_flags, &xa, &xb, &ya, &yb,
+			      &src_x,  &src_y, &src_w, &src_h,
+			      &drw_x, &drw_y, &drw_w, &drw_h,
+			      &left, &top, &right, &bottom, &dstBox,
+			      &npixels, &nlines, &clipRegion, width, height)) {
+		return Success;
+	}
+
+	/* note: in Xv code, pixel buffer is src, uploaded YUV data is dst
+	 * which becomes the src for the PutTextureImage() step.. so dstPitch
+	 * is really our srcPitch (of src pixmap) and srcPitch's are ignored..
+	 * as are a couple other things..
+	 */
+	if (NV_calculate_pitches_and_mem_size(pNv, action_flags, &srcPitch,
+					      &srcPitch2, &dstPitch, &s2offset,
+					      &s3offset, &uv_offset,
+					      &newFBSize, &newTTSize,
+					      &line_len, npixels, nlines,
+					      width, height)) {
+		return BadImplementation;
+	}
+
+	/* Ensure src and dst pixmap is in offscreen memory */
+	pNv->exa_force_cp = TRUE;
+	exaMoveInPixmap(dstPix);
+	exaMoveInPixmap(srcPix);
+	pNv->exa_force_cp = FALSE;
+
+	if (!exaGetPixmapDriverPrivate(dstPix) ||
+			!exaGetPixmapDriverPrivate(srcPix)) {
+		return BadAlloc;
+	}
+
+	src = nouveau_pixmap_bo(srcPix);
+
+#ifdef COMPOSITE
+	/* Convert screen coords to pixmap coords */
+	if (dstPix->screen_x || dstPix->screen_y) {
+		REGION_TRANSLATE(pScrn->pScreen, &clipRegion,
+				 -dstPix->screen_x, -dstPix->screen_y);
+		dstBox.x1 -= dstPix->screen_x;
+		dstBox.x2 -= dstPix->screen_x;
+		dstBox.y1 -= dstPix->screen_y;
+		dstBox.y2 -= dstPix->screen_y;
+	}
+#endif
+
+	/* TODO check if src buffer is already in VRAM.. for hw decode
+	 * we probably want to allow giving the client buffers in VRAM
+	 * directly (via non-fourcc format values)
+	 */
+
+	ret = nouveau_xv_bo_realloc(pScrn, NOUVEAU_BO_VRAM, newFBSize,
+				    &pPriv->video_mem);
+	if (ret)
+		return BadAlloc;
+
+	ret = nouveau_xv_m2mf(pScrn, action_flags, src, pPriv->video_mem,
+			offset, uv_offset, nlines, line_len, dstPitch);
+	if (ret != Success) {
+		return ret;
+	}
+
+	if (pNv->Architecture == NV_ARCH_30) {
+		ret = NV30PutTextureImage(pScrn, pPriv->video_mem,
+					  offset, uv_offset,
+					  id, dstPitch, &dstBox, 0, 0,
+					  xb, yb, npixels, nlines,
+					  src_w, src_h, drw_w, drw_h,
+					  &clipRegion, dstPix, NULL);
+	} else if (pNv->Architecture == NV_ARCH_40) {
+		ret = NV40PutTextureImage(pScrn, pPriv->video_mem,
+					  offset, uv_offset,
+					  id, dstPitch, &dstBox, 0, 0,
+					  xb, yb, npixels, nlines,
+					  src_w, src_h, drw_w, drw_h,
+					  &clipRegion, dstPix, NULL);
+	} else if (pNv->Architecture == NV_ARCH_50) {
+		ret = nv50_xv_image_put(pScrn, pPriv->video_mem,
+					offset, uv_offset,
+					id, dstPitch, &dstBox, 0, 0,
+					xb, yb, npixels, nlines,
+					src_w, src_h, drw_w, drw_h,
+					&clipRegion, dstPix, NULL);
+	} else {
+		ret = nvc0_xv_image_put(pScrn, pPriv->video_mem,
+					offset, uv_offset,
+					id, dstPitch, &dstBox, 0, 0,
+					xb, yb, npixels, nlines,
+					src_w, src_h, drw_w, drw_h,
+					&clipRegion, dstPix, NULL);
+	}
+
+#ifdef COMPOSITE
+	/* Damage tracking */
+	if (!(action_flags & USE_OVERLAY))
+		DamageDamageRegion(&dstPix->drawable, &clipRegion);
+#endif
+
+	RegionUninit(&clipRegion);
+
+	return ret;
+}
+
 
 /**
  * QueryImageAttributes

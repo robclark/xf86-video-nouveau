@@ -343,7 +343,7 @@ nvc0_xv_image_put(ScrnInfoPtr pScrn,
 	if (!nvc0_xv_state_emit(ppix, id, src, packed_y, uv, width, height))
 		return BadAlloc;
 
-	if (0 && pPriv->SyncToVBlank) {
+	if (0 && pPriv && pPriv->SyncToVBlank) {
 		NV50SyncToVBlank(ppix, dstBox);
 	}
 

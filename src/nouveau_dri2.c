@@ -10,6 +10,10 @@
 #include "dri2.h"
 #endif
 
+// put these somewhere common..
+#define FOURCC(a, b, c, d) ((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | ((uint32_t)(uint8_t)(c) << 16) | ((uint32_t)(uint8_t)(d) << 24 ))
+#define FOURCC_STR(str)    FOURCC(str[0], str[1], str[2], str[3])
+
 #if defined(DRI2) && DRI2INFOREC_VERSION >= 3
 struct nouveau_dri2_buffer {
 	DRI2BufferRec base;
@@ -22,19 +26,87 @@ nouveau_dri2_buffer(DRI2BufferPtr buf)
 	return (struct nouveau_dri2_buffer *)buf;
 }
 
+static DRI2BufferPtr
+nouveau_dri2_create_buffer_2(DrawablePtr pDraw, unsigned int attachment,
+		   unsigned int format, PixmapPtr ppix)
+{
+	ScreenPtr pScreen = pDraw->pScreen;
+	NVPtr pNv = NVPTR(xf86Screens[pScreen->myNum]);
+	struct nouveau_pixmap *nvpix;
+	struct nouveau_dri2_buffer *nvbuf;
+
+	nvbuf = calloc(1, sizeof(*nvbuf));
+	if (!nvbuf) {
+		// XXX cleanup..
+		return NULL;
+	}
+
+	pNv->exa_force_cp = TRUE;
+	exaMoveInPixmap(ppix);
+	pNv->exa_force_cp = FALSE;
+
+	nvbuf->base.attachment = attachment;
+	nvbuf->base.pitch = ppix->devKind;
+	nvbuf->base.cpp = ppix->drawable.bitsPerPixel / 8;
+	nvbuf->base.driverPrivate = nvbuf;
+	nvbuf->base.format = format;
+	nvbuf->base.flags = 0;
+	nvbuf->ppix = ppix;
+
+	nvpix = nouveau_pixmap(ppix);
+	if (!nvpix || !nvpix->bo ||
+	    nouveau_bo_handle_get(nvpix->bo, &nvbuf->base.name)) {
+		pScreen->DestroyPixmap(nvbuf->ppix);
+		free(nvbuf);
+		return NULL;
+	}
+
+	return &nvbuf->base;
+
+}
+
+static DRI2BufferPtr
+nouveau_dri2_create_buffer_vid(DrawablePtr pDraw, unsigned int attachment,
+			   unsigned int format, unsigned int width, unsigned int height)
+{
+	ScreenPtr pScreen = pDraw->pScreen;
+	PixmapPtr ppix;
+	int bpp;
+
+	switch(format) {
+	case FOURCC('I','4','2','0'):
+	case FOURCC('Y','V','1','2'):
+		/* to avoid confusing CreatePixmap too much, call these 1cpp
+		 *  and 1.5x height
+		 */
+		bpp = 8;
+		height = ((height + 1) & ~1) * 3 / 2;
+		break;
+	case FOURCC('Y','U','Y','2'):
+	case FOURCC('U','Y','V','Y'):
+		bpp = 16;
+		break;
+	case FOURCC('R','G','B','3'):  /* depth=24, bpp=32 */
+	case 24:
+	case FOURCC('R','G','B','4'):  /* depth=32, bpp=32 */
+	case 32:
+		bpp = 32;
+		break;
+	default:
+		return NULL;
+	}
+
+	ppix = pScreen->CreatePixmap(pScreen, width, height, bpp, NOUVEAU_CREATE_PIXMAP_VIDEO);
+
+	return nouveau_dri2_create_buffer_2(pDraw, attachment, format, ppix);
+}
+
 DRI2BufferPtr
 nouveau_dri2_create_buffer(DrawablePtr pDraw, unsigned int attachment,
 			   unsigned int format)
 {
 	ScreenPtr pScreen = pDraw->pScreen;
-	NVPtr pNv = NVPTR(xf86Screens[pScreen->myNum]);
-	struct nouveau_dri2_buffer *nvbuf;
-	struct nouveau_pixmap *nvpix;
 	PixmapPtr ppix;
-
-	nvbuf = calloc(1, sizeof(*nvbuf));
-	if (!nvbuf)
-		return NULL;
 
 	if (attachment == DRI2BufferFrontLeft) {
 		if (pDraw->type == DRAWABLE_PIXMAP) {
@@ -59,27 +131,7 @@ nouveau_dri2_create_buffer(DrawablePtr pDraw, unsigned int attachment,
 					     usage_hint);
 	}
 
-	pNv->exa_force_cp = TRUE;
-	exaMoveInPixmap(ppix);
-	pNv->exa_force_cp = FALSE;
-
-	nvbuf->base.attachment = attachment;
-	nvbuf->base.pitch = ppix->devKind;
-	nvbuf->base.cpp = ppix->drawable.bitsPerPixel / 8;
-	nvbuf->base.driverPrivate = nvbuf;
-	nvbuf->base.format = format;
-	nvbuf->base.flags = 0;
-	nvbuf->ppix = ppix;
-
-	nvpix = nouveau_pixmap(ppix);
-	if (!nvpix || !nvpix->bo ||
-	    nouveau_bo_handle_get(nvpix->bo, &nvbuf->base.name)) {
-		pScreen->DestroyPixmap(nvbuf->ppix);
-		free(nvbuf);
-		return NULL;
-	}
-
-	return &nvbuf->base;
+	return nouveau_dri2_create_buffer_2(pDraw, attachment, format, ppix);
 }
 
 void
@@ -94,6 +146,13 @@ nouveau_dri2_destroy_buffer(DrawablePtr pDraw, DRI2BufferPtr buf)
 	pDraw->pScreen->DestroyPixmap(nvbuf->ppix);
 	free(nvbuf);
 }
+
+/* moveme: */
+int
+nouveau_put_texture_image(DrawablePtr pDraw, PixmapPtr srcPix, int id,
+		short src_x, short src_y, short drw_x, short drw_y,
+		short src_w, short src_h, short drw_w, short drw_h,
+		short width, short height);
 
 void
 nouveau_dri2_copy_region(DrawablePtr pDraw, RegionPtr pRegion,
@@ -332,6 +391,49 @@ fail:
 }
 
 static Bool
+nouveau_dri2_schedule_swap_vid(ClientPtr client, DrawablePtr draw,
+			   DRI2BufferPtr dst, DRI2BufferPtr src,
+			   BoxPtr b, DrawablePtr osd,
+			   CARD64 *target_msc, CARD64 divisor, CARD64 remainder,
+			   DRI2SwapEventPtr func, void *data)
+{
+	ScrnInfoPtr scrn = xf86Screens[draw->pScreen->myNum];
+	PixmapPtr src_pix = nouveau_dri2_buffer(src)->ppix;
+	short width, height;
+	int ret;
+
+	width  = src_pix->drawable.width;
+	height = src_pix->drawable.height;
+
+	if (src->format == FOURCC_STR("I420") ||
+			src->format == FOURCC_STR("YV12")) {
+		/* undo the 'height *= 1.5' trick to recover real height */
+		height = (height * 2) / 3;
+	}
+
+	/* attempt to hijack some of the XV USE_TEXTURE code.. maybe not the
+	 * cleanest way, or even work on all cards, but just for proof of concept..
+	 *
+	 * XXX this probably won't work for RGB formats, at least not on all
+	 * chipset versions (like NV50).. probably want to use the CopyRegion
+	 * code path (or something similar?) for RGB??
+	 */
+	ret = nouveau_put_texture_image(draw, src_pix, src->format,
+			b->x1, b->y1, draw->x, draw->y,
+			b->x2 - b->x1, b->y2 - b->y1, draw->width, draw->height,
+			width, height);
+
+	if (ret != Success) {
+		xf86DrvMsg(scrn->scrnIndex, X_WARNING, "blit failed: %d\n", ret);
+		return FALSE;
+	}
+
+	DRI2SwapComplete(client, draw, 0, 0, 0, DRI2_BLIT_COMPLETE, func, data);
+
+	return TRUE;
+}
+
+static Bool
 nouveau_dri2_schedule_wait(ClientPtr client, DrawablePtr draw,
 			   CARD64 target_msc, CARD64 divisor, CARD64 remainder)
 {
@@ -396,6 +498,37 @@ nouveau_dri2_get_msc(DrawablePtr draw, CARD64 *ust, CARD64 *msc)
 	return TRUE;
 }
 
+#define ATOM(a) MakeAtom(a, sizeof(a) - 1, TRUE)
+
+static int
+nouveau_set_attribute(DrawablePtr pDraw, Atom attribute,
+		int len, const CARD32 *val)
+{
+	/* just for testing.. bogus colorspace conversion matrix.. */
+	if (attribute == ATOM("XV_CSC_MATRIX")) {
+		return Success;
+	}
+	return BadMatch;
+}
+
+static int
+nouveau_get_attribute(DrawablePtr pDraw, Atom attribute,
+		int *len, const CARD32 **val)
+{
+	/* just for testing.. bogus colorspace conversion matrix.. */
+	if (attribute == ATOM("XV_CSC_MATRIX")) {
+		static const CARD32 csc[] = {
+				0x00, 0x01, 0x02, 0x03,
+				0x10, 0x11, 0x12, 0x13,
+				0x20, 0x21, 0x22, 0x23,
+		};
+		*val = csc;
+		*len = sizeof(csc) / 4;
+		return Success;
+	}
+	return BadMatch;
+}
+
 void
 nouveau_dri2_vblank_handler(int fd, unsigned int frame,
 			    unsigned int tv_sec, unsigned int tv_usec,
@@ -428,28 +561,47 @@ nouveau_dri2_init(ScreenPtr pScreen)
 	ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
 	NVPtr pNv = NVPTR(pScrn);
 	DRI2InfoRec dri2 = { 0 };
-	const char *drivernames[2][2] = {
-		{ "nouveau", "nouveau" },
-		{ "nouveau_vieux", "nouveau_vieux" }
+	const char *drivernames[2][3] = {
+		{ "nouveau", "nouveau", "nouveau" },
+		{ "nouveau_vieux", "nouveau_vieux", NULL }
+	};
+	const unsigned int formats[] = {
+			FOURCC_STR("YUY2"),
+			FOURCC_STR("YV12"),
+			FOURCC_STR("UYVY"),
+			FOURCC_STR("I420"),
+			FOURCC_STR("RGB3"),  /* depth=24, bpp=32 */
+			FOURCC_STR("RGB4"),  /* depth=32, bpp=32 */
+			/* non-common formats: */
+			// XXX check what might have been passed by mesa!!
+			24,
+			32,
 	};
 
 	if (pNv->Architecture >= NV_ARCH_30)
 		dri2.driverNames = drivernames[0];
 	else
 		dri2.driverNames = drivernames[1];
-	dri2.numDrivers = 2;
+	dri2.numDrivers = 3;
 	dri2.driverName = dri2.driverNames[0];
+
+	dri2.numFormats = ARRAY_SIZE(formats);
+	dri2.formats = formats;
 
 	dri2.fd = nouveau_device(pNv->dev)->fd;
 	dri2.deviceName = pNv->drm_device_name;
 
 	dri2.version = DRI2INFOREC_VERSION;
 	dri2.CreateBuffer = nouveau_dri2_create_buffer;
+	dri2.CreateBufferVid = nouveau_dri2_create_buffer_vid;
 	dri2.DestroyBuffer = nouveau_dri2_destroy_buffer;
 	dri2.CopyRegion = nouveau_dri2_copy_region;
 	dri2.ScheduleSwap = nouveau_dri2_schedule_swap;
+	dri2.ScheduleSwapVid = nouveau_dri2_schedule_swap_vid;
 	dri2.ScheduleWaitMSC = nouveau_dri2_schedule_wait;
 	dri2.GetMSC = nouveau_dri2_get_msc;
+	dri2.SetAttribute = nouveau_set_attribute;
+	dri2.GetAttribute = nouveau_get_attribute;
 
 	return DRI2ScreenInit(pScreen, &dri2);
 }
